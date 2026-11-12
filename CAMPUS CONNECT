@@ -1,0 +1,410 @@
+import os
+import random
+from datetime import datetime, timedelta
+from flask import (
+    Flask, render_template, request, redirect, url_for, flash, session, jsonify
+)
+from flask_mail import Mail, Message
+from config import Config
+from models import db, User, EmailOTP, Question, Answer, Notification
+
+app = Flask(__name__)
+app.config.from_object(Config)
+
+db.init_app(app)
+mail = Mail(app)
+
+DEPARTMENTS = [
+    "Computer Science & Engineering",
+    "Information Technology",
+    "Electronics & Communication Engineering",
+    "Electrical & Electronics Engineering",
+    "Mechanical Engineering",
+    "Civil Engineering",
+    "Biotechnology",
+    "Artificial Intelligence & Data Science",
+    "Business Administration (MBA)",
+    "Chemical Engineering"
+]
+
+YEARS = [
+    "1st Year (Student)",
+    "2nd Year (Student)",
+    "3rd Year (Student)",
+    "Final Year (Student)",
+    "Faculty Member",
+    "Alumni"
+]
+
+@app.context_processor
+def inject_global_data():
+    unread_count = 0
+    current_user = None
+    if 'user_id' in session:
+        current_user = User.query.get(session['user_id'])
+        if current_user:
+            unread_count = Notification.query.filter_by(user_id=current_user.id, is_read=False).count()
+    return dict(
+        current_user=current_user,
+        unread_notifications_count=unread_count,
+        departments=DEPARTMENTS,
+        years=YEARS
+    )
+
+def is_valid_college_email(email):
+    domain = Config.COLLEGE_EMAIL_DOMAIN.strip().lower()
+    if not email or '@' not in email:
+        return False
+    if domain:
+        return email.lower().endswith(domain)
+    return True
+
+def send_otp_email(to_email, otp_code):
+    try:
+        if not app.config.get('MAIL_USERNAME'):
+            print(f"\n==========================================")
+            print(f"[OTP SIMULATION] Verification code for {to_email}: {otp_code}")
+            print(f"==========================================\n")
+            return True
+        msg = Message(
+            subject="CampusConnect Verification Code",
+            recipients=[to_email],
+            body=f"Your CampusConnect OTP is: {otp_code}. It will expire in 10 minutes.\nDo not share this OTP with anyone."
+        )
+        mail.send(msg)
+        return True
+    except Exception as e:
+        print(f"Failed to send email: {e}")
+        return False
+
+def send_notification_email(to_email, question_title):
+    try:
+        if not app.config.get('MAIL_USERNAME'):
+            print(f"[NOTIFY SIMULATION] Answer notification sent to {to_email} for doubt: {question_title}")
+            return True
+        msg = Message(
+            subject="New Private Answer Received - CampusConnect",
+            recipients=[to_email],
+            body=f"Hello!\n\nA faculty/senior/alumni has answered your doubt: '{question_title}'.\n\nPlease log in to CampusConnect to view your private answer.\nBest regards,\nCampusConnect Team"
+        )
+        mail.send(msg)
+        return True
+    except Exception as e:
+        print(f"Failed to send notification email: {e}")
+        return False
+
+# ----------------- ROUTES ----------------- #
+
+# PAGE 1: ROLE SELECTION (Landing Page for unauthenticated users)
+@app.route('/')
+def index():
+    if 'user_id' not in session:
+        # Show Page 1: Role selector with blank background and logo in center
+        return render_template('role_select.html')
+
+    # For logged-in user, display customized dashboard
+    dept_filter = request.args.get('department')
+    search_query = request.args.get('q')
+
+    query = Question.query.filter_by(is_reported=False)
+    if dept_filter:
+        query = query.filter_by(target_department=dept_filter)
+    if search_query:
+        query = query.filter(Question.title.ilike(f"%{search_query}%") | Question.description.ilike(f"%{search_query}%"))
+
+    questions = query.order_by(Question.created_at.desc()).all()
+    return render_template('index.html', questions=questions, selected_dept=dept_filter, search_query=search_query)
+
+# PAGE 2: SIGN IN USING COLLEGE EMAIL (Top-left logo)
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if 'user_id' in session:
+        return redirect(url_for('index'))
+
+    # Allow query parameter ?role=student/faculty/alumni
+    role_param = request.args.get('role')
+    if role_param in ['student', 'faculty', 'alumni']:
+        session['intended_role'] = role_param
+
+    intended_role = session.get('intended_role', 'student')
+
+    if request.method == 'POST':
+        email = request.form.get('email', '').strip().lower()
+        role_from_form = request.form.get('intended_role')
+        if role_from_form in ['student', 'faculty', 'alumni']:
+            intended_role = role_from_form
+            session['intended_role'] = role_from_form
+
+        if not is_valid_college_email(email):
+            flash(f"Please use a valid college email address{' ending with ' + Config.COLLEGE_EMAIL_DOMAIN if Config.COLLEGE_EMAIL_DOMAIN else ''}.", "danger")
+            return render_template('login.html', intended_role=intended_role)
+
+        user = User.query.filter_by(college_email=email).first()
+
+        # Direct sign-in without OTP if email ends with @sece.ac.in
+        if email.endswith('@sece.ac.in'):
+            if not user:
+                session['verified_email'] = email
+                flash("SECE college email verified! Please complete your profile.", "success")
+                return redirect(url_for('register_profile'))
+            
+            user.is_verified = True
+            db.session.commit()
+            session['user_id'] = user.id
+            flash(f"Welcome back, {user.full_name}!", "success")
+            return redirect(url_for('index'))
+
+        # Generate 6-digit OTP for non-sece emails
+        otp_code = str(random.randint(100000, 999999))
+        expires_at = datetime.utcnow() + timedelta(minutes=10)
+
+        otp_record = EmailOTP(email=email, otp_code=otp_code, expires_at=expires_at)
+        db.session.add(otp_record)
+        db.session.commit()
+
+        send_otp_email(email, otp_code)
+        session['pending_email'] = email
+        flash(f"A 6-digit OTP has been sent to {email}. (Check console/inbox)", "info")
+        return redirect(url_for('verify_otp'))
+
+    return render_template('login.html', intended_role=intended_role)
+
+@app.route('/verify-otp', methods=['GET', 'POST'])
+def verify_otp():
+    pending_email = session.get('pending_email')
+    if not pending_email:
+        flash("Please initiate login first.", "warning")
+        return redirect(url_for('login'))
+
+    if request.method == 'POST':
+        entered_otp = request.form.get('otp', '').strip()
+        record = EmailOTP.query.filter_by(email=pending_email, is_used=False).order_by(EmailOTP.created_at.desc()).first()
+
+        if record and record.otp_code == entered_otp and record.expires_at > datetime.utcnow():
+            record.is_used = True
+            user = User.query.filter_by(college_email=pending_email).first()
+
+            if not user:
+                session['verified_email'] = pending_email
+                session.pop('pending_email', None)
+                flash("Email verified! Please complete your registration profile.", "success")
+                return redirect(url_for('register_profile'))
+            
+            user.is_verified = True
+            db.session.commit()
+            session['user_id'] = user.id
+            session.pop('pending_email', None)
+            flash(f"Welcome back, {user.full_name}!", "success")
+            return redirect(url_for('index'))
+        else:
+            flash("Invalid or expired OTP. Please try again.", "danger")
+
+    return render_template('verify_otp.html', email=pending_email)
+
+@app.route('/register-profile', methods=['GET', 'POST'])
+def register_profile():
+    verified_email = session.get('verified_email')
+    if not verified_email:
+        flash("Please verify your college email first.", "warning")
+        return redirect(url_for('login'))
+
+    if request.method == 'POST':
+        full_name = request.form.get('full_name', '').strip()
+        role = request.form.get('role', 'student')
+        department = request.form.get('department')
+        year_of_study = request.form.get('year_of_study')
+
+        if not full_name or not department or not year_of_study:
+            flash("All fields are required.", "danger")
+            intended_role = session.get('intended_role', 'student')
+            return render_template('register_profile.html', email=verified_email, intended_role=intended_role)
+
+        user = User(
+            full_name=full_name,
+            college_email=verified_email,
+            role=role,
+            department=department,
+            year_of_study=year_of_study,
+            is_verified=True
+        )
+        db.session.add(user)
+        db.session.commit()
+
+        session.pop('verified_email', None)
+        session['user_id'] = user.id
+        flash("Registration complete! Welcome to CampusConnect.", "success")
+        return redirect(url_for('index'))
+
+    intended_role = session.get('intended_role', 'student')
+    return render_template('register_profile.html', email=verified_email, intended_role=intended_role)
+
+@app.route('/logout')
+def logout():
+    session.clear()
+    flash("You have been logged out.", "info")
+    return redirect(url_for('index'))
+
+@app.route('/ask-question', methods=['GET', 'POST'])
+def ask_question():
+    if 'user_id' not in session:
+        flash("You must be logged in with college email to post a doubt.", "warning")
+        return redirect(url_for('login'))
+
+    if request.method == 'POST':
+        target_department = request.form.get('target_department')
+        title = request.form.get('title', '').strip()
+        description = request.form.get('description', '').strip()
+
+        if not target_department or not title or not description:
+            flash("All fields are required.", "danger")
+            return render_template('ask_question.html')
+
+        question = Question(
+            asker_id=session['user_id'],
+            target_department=target_department,
+            title=title,
+            description=description
+        )
+        db.session.add(question)
+        db.session.commit()
+        flash("Your question has been posted to the public board! Answers will be privately delivered to you.", "success")
+        return redirect(url_for('question_detail', question_id=question.id))
+
+    return render_template('ask_question.html')
+
+@app.route('/question/<int:question_id>', methods=['GET', 'POST'])
+def question_detail(question_id):
+    question = Question.query.get_or_404(question_id)
+    current_user_id = session.get('user_id')
+    current_user = User.query.get(current_user_id) if current_user_id else None
+
+    # Answers are STRICTLY PRIVATE: visible only to asker or the responder
+    if current_user:
+        if current_user.id == question.asker_id or current_user.role == 'admin':
+            answers = Answer.query.filter_by(question_id=question.id).order_by(Answer.created_at.desc()).all()
+        else:
+            answers = Answer.query.filter_by(question_id=question.id, responder_id=current_user.id).order_by(Answer.created_at.desc()).all()
+    else:
+        answers = []
+
+    total_answers_count = len(question.answers)
+
+    return render_template(
+        'question_detail.html',
+        question=question,
+        answers=answers,
+        total_answers_count=total_answers_count
+    )
+
+@app.route('/question/<int:question_id>/answer', methods=['POST'])
+def post_answer(question_id):
+    if 'user_id' not in session:
+        flash("You must be logged in to answer questions.", "danger")
+        return redirect(url_for('login'))
+
+    question = Question.query.get_or_404(question_id)
+    content = request.form.get('content', '').strip()
+
+    if not content:
+        flash("Answer cannot be empty.", "danger")
+        return redirect(url_for('question_detail', question_id=question.id))
+
+    answer = Answer(
+        question_id=question.id,
+        responder_id=session['user_id'],
+        content=content
+    )
+    db.session.add(answer)
+
+    question.status = 'answered'
+
+    # Notify asker
+    notification = Notification(
+        user_id=question.asker_id,
+        message=f"Someone answered your question: '{question.title[:40]}...'",
+        link=url_for('question_detail', question_id=question.id)
+    )
+    db.session.add(notification)
+    db.session.commit()
+
+    send_notification_email(question.asker.college_email, question.title)
+
+    flash("Your private answer has been submitted to the question asker!", "success")
+    return redirect(url_for('question_detail', question_id=question.id))
+
+@app.route('/my-doubts')
+def my_doubts():
+    if 'user_id' not in session:
+        flash("Please log in to view your doubts.", "warning")
+        return redirect(url_for('login'))
+
+    user = User.query.get(session['user_id'])
+    questions = Question.query.filter_by(asker_id=user.id).order_by(Question.created_at.desc()).all()
+    
+    # Also fetch questions the user has answered
+    answered_ids = [a.question_id for a in Answer.query.filter_by(responder_id=user.id).all()]
+    answered_questions = Question.query.filter(Question.id.in_(answered_ids)).all() if answered_ids else []
+
+    return render_template('my_doubts.html', questions=questions, answered_questions=answered_questions)
+
+@app.route('/notifications')
+def notifications():
+    if 'user_id' not in session:
+        flash("Please log in to view notifications.", "warning")
+        return redirect(url_for('login'))
+
+    user_id = session['user_id']
+    notes = Notification.query.filter_by(user_id=user_id).order_by(Notification.created_at.desc()).all()
+    
+    # Mark as read
+    for n in notes:
+        n.is_read = True
+    db.session.commit()
+
+    return render_template('notifications.html', notifications=notes)
+
+@app.route('/admin')
+def admin_dashboard():
+    if 'user_id' not in session:
+        flash("Admin login required.", "danger")
+        return redirect(url_for('login'))
+
+    user = User.query.get(session['user_id'])
+    if not user or user.role != 'admin':
+        flash("Access denied. Admin rights required.", "danger")
+        return redirect(url_for('index'))
+
+    reported_questions = Question.query.filter_by(is_reported=True).all()
+    all_users = User.query.all()
+    return render_template('admin.html', reported_questions=reported_questions, users=all_users)
+
+@app.route('/report-question/<int:question_id>', methods=['POST'])
+def report_question(question_id):
+    question = Question.query.get_or_404(question_id)
+    question.is_reported = True
+    db.session.commit()
+    flash("The question has been reported for review.", "warning")
+    return redirect(url_for('index'))
+
+@app.route('/delete-question/<int:question_id>', methods=['POST'])
+def delete_question(question_id):
+    if 'user_id' not in session:
+        flash("Access denied.", "danger")
+        return redirect(url_for('login'))
+
+    user = User.query.get(session['user_id'])
+    question = Question.query.get_or_404(question_id)
+
+    if user.role != 'admin' and user.id != question.asker_id:
+        flash("You are not authorized to delete this.", "danger")
+        return redirect(url_for('index'))
+
+    db.session.delete(question)
+    db.session.commit()
+    flash("Question successfully deleted.", "info")
+    return redirect(url_for('index'))
+
+if __name__ == '__main__':
+    with app.app_context():
+        db.create_all()
+    app.run(debug=True, port=5000)
